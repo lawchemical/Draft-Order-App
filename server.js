@@ -153,7 +153,6 @@ app.post('/create-draft-order', async (req, res) => {
       const exist = await idemGet(idempotencyKey);
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
-
 const lines = items.map(it => ({
   gid: String(it.variantId).startsWith('gid://')
     ? String(it.variantId)
@@ -163,9 +162,10 @@ const lines = items.map(it => ({
   cording: !!it.cording,
   fabricName: it.fabricName || '',
   properties: Array.isArray(it.properties) ? it.properties : [],
-  // NEW: pass through the cart’s computed price (in cents) if present
+  // NEW: carry cart price (in cents) if provided
   unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
 }));
+
 
 
     const gids = lines.map(l => l.gid);
