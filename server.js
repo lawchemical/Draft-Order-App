@@ -1,16 +1,26 @@
+// server.js
+/**
+ * Draft Order Service — sticky draft + custom pricing
+ * - Downpricing (variant >= desired): keep variantId, apply per-unit FIXED_AMOUNT discount
+ * - Uppricing (desired > variant): use a CUSTOM line at your price (no variantId)
+ * - Supports prevDraftId to UPDATE an existing draft (sticky)
+ */
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 
 // ---------- Config ----------
-const SHOP   = process.env.SHOP;
-const TOKEN  = process.env.ADMIN_API_TOKEN;
+const SHOP   = process.env.SHOP;                       // your-store.myshopify.com
+const TOKEN  = process.env.ADMIN_API_TOKEN;            // Admin API token (Draft Orders write)
 const APIURL = `https://${SHOP}/admin/api/2024-07/graphql.json`;
-const ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+const ORIGINS = (process.env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const PORT = process.env.PORT || 8080;
 
-// ---------- Redis (optional) ----------
+// ---------- Optional Redis (for cache/idempotency) ----------
 let redis = null;
 if (process.env.REDIS_URL) {
   const { createClient } = await import('redis');
@@ -21,9 +31,11 @@ if (process.env.REDIS_URL) {
 
 // ---------- Express ----------
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+app.use(express.json({ limit: '200kb' }));
 app.use(cors({
-  origin: (origin, cb) => (!origin || ORIGINS.includes(origin)) ? cb(null, true) : cb(new Error('CORS')),
+  origin: (origin, cb) => (!origin || ORIGINS.length === 0 || ORIGINS.includes(origin))
+    ? cb(null, true)
+    : cb(new Error('CORS: Origin not allowed')),
 }));
 
 // ---------- Helpers ----------
@@ -32,8 +44,9 @@ async function withBackoff(fn, { tries = 3, baseMs = 250 } = {}) {
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      if (!/rate|429|5\d\d/i.test(String(e?.message || '')) && !e.retryable) break;
-      await new Promise(r => setTimeout(r, baseMs * (2 ** i) + Math.random() * 100));
+      const msg = String(e?.message || '');
+      if (!/rate|429|5\d\d/i.test(msg) && !e.retryable) break;
+      await new Promise(r => setTimeout(r, baseMs * (2 ** i) + Math.floor(Math.random() * 100)));
     }
   }
   throw lastErr;
@@ -43,14 +56,17 @@ async function adminGQL(query, variables) {
   return withBackoff(async () => {
     const r = await fetch(APIURL, {
       method: 'POST',
-      headers: { 'X-Shopify-Access-Token': TOKEN, 'Content-Type': 'application/json' },
+      headers: {
+        'X-Shopify-Access-Token': TOKEN,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({ query, variables })
     });
-    if (r.status === 429) {
-      const e = new Error('429 rate limited'); e.retryable = true; throw e;
-    }
+    if (r.status === 429) { const e = new Error('429 rate limited'); e.retryable = true; throw e; }
     if (!r.ok) {
-      const e = new Error(`${r.status} ${r.statusText}`); e.retryable = r.status >= 500; throw e;
+      const e = new Error(`${r.status} ${r.statusText}`);
+      e.retryable = r.status >= 500;
+      throw e;
     }
     const j = await r.json();
     if (j.errors?.length) throw new Error(j.errors[0].message);
@@ -58,15 +74,19 @@ async function adminGQL(query, variables) {
   });
 }
 
-// ---------- Cache ----------
+// ---------- Cache (in-memory with optional Redis backing) ----------
 const MEM_TTL_MS = 10 * 60 * 1000;
-const memCache = new Map();
-const memGet = key => {
+const memCache = new Map(); // key -> { value, exp }
+
+function memGet(key) {
   const v = memCache.get(key);
-  if (!v || v.exp < Date.now()) return null;
+  if (!v) return null;
+  if (v.exp < Date.now()) { memCache.delete(key); return null; }
   return v.value;
-};
-const memSet = (key, value, ttl = MEM_TTL_MS) => memCache.set(key, { value, exp: Date.now() + ttl });
+}
+function memSet(key, value, ttl = MEM_TTL_MS) {
+  memCache.set(key, { value, exp: Date.now() + ttl });
+}
 
 async function cacheGet(key) {
   if (redis) {
@@ -80,6 +100,7 @@ async function cacheSet(key, value, ttlSec = 600) {
   else memSet(key, value, ttlSec * 1000);
 }
 
+// ---------- Idempotency (optional) ----------
 async function idemGet(key) {
   return redis ? JSON.parse(await redis.get(`idem:${key}`) || 'null') : memGet(`idem:${key}`);
 }
@@ -89,18 +110,24 @@ async function idemSet(key, payload, ttlSec = 600) {
 }
 
 // ---------- Pricing ----------
+/**
+ * Your “F as base” scheme:
+ *  F = A * 2.06  →  A = F / 2.06
+ *  unit(A) = A * (1 + upcharge[grade]) * (cording ? 1.10 : 1)
+ */
 const F_MULTIPLIER = 2.06;
 const GRADE_UPCHARGE = { A: 0, B: 0, C: 0.08, D: 0.32, E: 0.63, F: 1.06 };
 
 function computeUnitPriceFromF({ fPrice, grade = 'A', cording = false }) {
-  const g = grade.toUpperCase();
+  const g = (grade || 'A').toUpperCase();
   const aPrice = (parseFloat(fPrice) || 0) / F_MULTIPLIER;
   let unit = aPrice * (1 + (GRADE_UPCHARGE[g] ?? 0));
   if (cording) unit *= 1.10;
-  return Math.round(unit * 100) / 100;
+  return Math.round(unit * 100) / 100; // dollars, 2dp
 }
 
-async function getVariantPricesBatch(gids) {
+// Fetch many variant base prices in one GQL call, cache results
+async function getVariantPricesBatch(gids = []) {
   const uniq = [...new Set(gids)];
   const prices = {};
   const missing = [];
@@ -117,41 +144,84 @@ async function getVariantPricesBatch(gids) {
   missing.forEach((gid, i) => {
     const node = data[`v${i}`];
     if (!node) throw new Error(`Variant not found: ${gid}`);
-    const priceNum = parseFloat(node.price);
+    const priceNum = parseFloat(node.price); // dollars
     prices[gid] = priceNum;
     cacheSet(`vprice:${gid}`, priceNum, 600);
   });
   return prices;
 }
 
+// ---------- Draft upsert helper ----------
+async function upsertDraft({ lineItems, note, tags = [], prevDraftId }) {
+  const variables = prevDraftId
+    ? { id: prevDraftId, input: { lineItems, note, tags } }
+    : { input: { lineItems, note, tags } };
+
+  const query = prevDraftId ? `
+    mutation($id: ID!, $input: DraftOrderInput!) {
+      draftOrderUpdate(id: $id, input: $input) {
+        draftOrder { id invoiceUrl }
+        userErrors { field message }
+      }
+    }
+  ` : `
+    mutation($input: DraftOrderInput!) {
+      draftOrderCreate(input: $input) {
+        draftOrder { id invoiceUrl }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await adminGQL(query, variables);
+  const payload = prevDraftId ? data?.draftOrderUpdate : data?.draftOrderCreate;
+  const err = payload?.userErrors?.[0];
+  if (err) throw new Error(err.message);
+  const draft = payload?.draftOrder;
+  if (!draft?.invoiceUrl) throw new Error('No invoiceUrl returned');
+  return draft; // { id, invoiceUrl }
+}
+
 // ---------- Route ----------
 let __debugOnce = false;
+
 app.post('/create-draft-order', async (req, res) => {
   try {
+    // One‑shot debug echo (safe subset)
     if (!__debugOnce) {
       __debugOnce = true;
-      console.log('[DEBUG one-shot]', {
-        origin: req.headers.origin,
-        items: (req.body?.items || []).map((it, i) => ({
-          i,
-          variantId: it?.variantId,
-          quantity: it?.quantity,
-          unitPriceCents: it?.unitPriceCents,
-          grade: it?.grade,
-          cording: it?.cording,
-          fabricName: it?.fabricName
-        }))
-      });
+      try {
+        const items = Array.isArray(req.body?.items) ? req.body.items : [];
+        console.log('[DEBUG one-shot]', {
+          origin: req.headers.origin,
+          count: items.length,
+          items: items.map((it, i) => ({
+            i,
+            variantId: it?.variantId,
+            quantity: it?.quantity,
+            unitPriceCents: it?.unitPriceCents,
+            grade: it?.grade,
+            cording: it?.cording,
+            fabricName: it?.fabricName
+          }))
+        });
+      } catch (e) {
+        console.log('[DEBUG one-shot] (skipped)', String(e?.message || e));
+      }
     }
 
-    const { items = [], note, tags = [], idempotencyKey } = req.body || {};
+    const { items = [], note, tags = [], idempotencyKey, prevDraftId } = req.body || {};
     if (!items.length) throw new Error('No items');
 
+    // Idempotency (optional)
     if (idempotencyKey) {
       const exist = await idemGet(idempotencyKey);
-      if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
+      if (exist?.invoiceUrl && exist?.id) {
+        return res.json({ draftId: exist.id, invoiceUrl: exist.invoiceUrl });
+      }
     }
 
+    // Normalize incoming items
     const lines = items.map(it => ({
       gid: String(it.variantId).startsWith('gid://')
         ? String(it.variantId)
@@ -164,31 +234,38 @@ app.post('/create-draft-order', async (req, res) => {
       unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
     }));
 
+    // Variant base prices (dollars)
     const priceMap = await getVariantPricesBatch(lines.map(l => l.gid));
 
+    // Build DraftOrderLineItemInput[]
     const lineItems = lines.map(l => {
-      const fPrice   = priceMap[l.gid] ?? 0;
+      const fPrice   = priceMap[l.gid] ?? 0; // dollars
       const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
+
+      // Treat as “fabric line” if fabric-like metadata is present
       const looksFabric =
         !!l.fabricName ||
         (Array.isArray(l.properties) && l.properties.some(p =>
           /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
         ));
+
+      // Choose unit price (prefer client for fabric lines)
       const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
-        ? (l.unitPriceCents / 100)
-        : computed;
+        ? (l.unitPriceCents / 100)   // dollars
+        : computed;                   // dollars
 
       console.log('[price]', { gid: l.gid, variant: fPrice, used: unit });
 
+      // DOWN‑PRICE: desired <= variant → variantId + per‑unit FIXED_AMOUNT discount
       if (unit <= fPrice) {
-        const off = fPrice - unit;
+        const off = fPrice - unit; // dollars
         return {
           variantId: l.gid,
           quantity: l.quantity,
           appliedDiscount: off > 0 ? {
             title: 'DISCOUNT',
             valueType: 'FIXED_AMOUNT',
-            value: Number(off.toFixed(2))
+            value: Number(off.toFixed(2)) // Float required by GraphQL
           } : null,
           customAttributes: [
             { key: 'Fabric',  value: l.fabricName },
@@ -199,11 +276,12 @@ app.post('/create-draft-order', async (req, res) => {
         };
       }
 
+      // UP‑PRICE: desired > variant → CUSTOM line at your price (no variantId)
       return {
         title: l.fabricName || 'Custom item',
         custom: true,
         quantity: l.quantity,
-        originalUnitPrice: Number(unit.toFixed(2)),
+        originalUnitPrice: Number(unit.toFixed(2)), // Float
         customAttributes: [
           { key: 'Fabric',  value: l.fabricName },
           { key: 'Grade',   value: l.grade },
@@ -213,30 +291,26 @@ app.post('/create-draft-order', async (req, res) => {
       };
     });
 
-    const mutation = `
-      mutation($input: DraftOrderInput!){
-        draftOrderCreate(input: $input){
-          draftOrder { id invoiceUrl }
-          userErrors { field message }
-        }
-      }`;
-    const data = await adminGQL(mutation, {
-      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
+    // Create or Update draft (sticky)
+    const draft = await upsertDraft({
+      lineItems,
+      note: note || 'Fabric tool',
+      tags: ['fabric-tool', ...tags],
+      prevDraftId
     });
 
-    const err = data?.draftOrderCreate?.userErrors?.[0];
-    if (err) throw new Error(err.message);
+    // Persist idempotency record
+    if (idempotencyKey) await idemSet(idempotencyKey, { id: draft.id, invoiceUrl: draft.invoiceUrl }, 600);
 
-    const invoiceUrl = data?.draftOrderCreate?.draftOrder?.invoiceUrl;
-    if (!invoiceUrl) throw new Error('No invoiceUrl returned');
-
-    if (idempotencyKey) await idemSet(idempotencyKey, { invoiceUrl }, 600);
-    res.json({ invoiceUrl });
+    res.json({ draftId: draft.id, invoiceUrl: draft.invoiceUrl });
   } catch (e) {
     console.error('create-draft-order error:', e);
     res.status(400).json({ error: e.message });
   }
 });
 
+// ---------- Health ----------
 app.get('/healthz', (_, res) => res.send('ok'));
+
+// ---------- Start ----------
 app.listen(PORT, () => console.log(`Draft Order service on :${PORT}`));
