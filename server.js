@@ -1,9 +1,8 @@
 /**
  * Draft Order Service — scalable edition
- * - Batch variant lookups
- * - In-memory cache (optional Redis)
- * - Idempotency (with TTL)
- * - Exponential backoff on Admin API
+ * Uses “F-grade as base” pricing:
+ *   A_price = F_price / 2.06
+ *   unit    = A_price * (1 + gradeUpcharge[grade]) * (cording ? 1.10 : 1)
  */
 import 'dotenv/config';
 import express from 'express';
@@ -39,7 +38,6 @@ async function withBackoff(fn, { tries = 3, baseMs = 250 } = {}) {
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      // Retry only on 429/5xx-ish
       const msg = String(e?.message || '');
       if (!/rate|429|5\d\d/i.test(msg) && !e.retryable) break;
       await new Promise(r => setTimeout(r, baseMs * Math.pow(2, i) + Math.floor(Math.random()*100)));
@@ -57,14 +55,10 @@ async function adminGQL(query, variables) {
       body: JSON.stringify({ query, variables })
     });
     if (r.status === 429) {
-      const e = new Error('429 rate limited');
-      e.retryable = true;
-      throw e;
+      const e = new Error('429 rate limited'); e.retryable = true; throw e;
     }
     if (!r.ok) {
-      const e = new Error(`${r.status} ${r.statusText}`);
-      e.retryable = r.status >= 500;
-      throw e;
+      const e = new Error(`${r.status} ${r.statusText}`); e.retryable = r.status >= 500; throw e;
     }
     const j = await r.json();
     if (j.errors?.length) throw new Error(j.errors[0].message);
@@ -85,7 +79,6 @@ function memSet(key, value, ttl = MEM_TTL_MS) {
   memCache.set(key, { value, exp: Date.now() + ttl });
 }
 
-// get/set cache with optional Redis
 async function cacheGet(key) {
   if (redis) {
     const val = await redis.get(key);
@@ -110,12 +103,16 @@ async function idemSet(key, payload, ttlSec = 600) {
   else memSet(`idem:${key}`, payload, ttlSec * 1000);
 }
 
-// ---------- Pricing ----------
-function computeUnitPrice({ basePrice, grade='A', cording=false }) {
-  const perc = { A:0, B:.10, C:.20, D:.30, E:.40 }[(grade||'A').toUpperCase()] ?? 0;
-  let u = basePrice * (1 + perc);
-  if (cording) u *= 1.10;
-  return Math.round(u * 100) / 100;
+// ---------- Pricing (F as base) ----------
+const F_MULTIPLIER = 2.06; // F is 106% over A -> F = A * 2.06
+const GRADE_UPCHARGE = { A: 0, B: 0, C: 0.08, D: 0.32, E: 0.63, F: 1.06 };
+
+function computeUnitPriceFromF({ fPrice, grade='A', cording=false }) {
+  const g = (grade || 'A').toUpperCase();
+  const aPrice = (parseFloat(fPrice) || 0) / F_MULTIPLIER;          // normalize to A
+  let unit = aPrice * (1 + (GRADE_UPCHARGE[g] ?? 0));               // apply grade
+  if (cording) unit *= 1.10;                                        // optional cording
+  return Math.round(unit * 100) / 100;                              // 2 decimals
 }
 
 // Batch fetch variant prices (unique GIDs)
@@ -123,7 +120,6 @@ async function getVariantPricesBatch(gids = []) {
   const uniq = [...new Set(gids)];
   const prices = {};
 
-  // Check cache first
   const missing = [];
   for (const gid of uniq) {
     const cached = await cacheGet(`vprice:${gid}`);
@@ -132,18 +128,16 @@ async function getVariantPricesBatch(gids = []) {
   }
   if (!missing.length) return prices;
 
-  // Build one batched query
   const fields = missing.map((gid, i) => `v${i}: productVariant(id: "${gid}") { id price }`).join('\n');
   const query = `query { ${fields} }`;
 
   const data = await adminGQL(query, {});
-  // Map results back
   missing.forEach((gid, i) => {
     const node = data[`v${i}`];
     if (!node) throw new Error(`Variant not found: ${gid}`);
     const priceNum = parseFloat(node.price);
     prices[gid] = priceNum;
-    cacheSet(`vprice:${gid}`, priceNum, 600); // 10 min
+    cacheSet(`vprice:${gid}`, priceNum, 600);
   });
 
   return prices;
@@ -155,13 +149,11 @@ app.post('/create-draft-order', async (req, res) => {
     const { items = [], note, tags = [], idempotencyKey } = req.body || {};
     if (!items.length) throw new Error('No items');
 
-    // Idempotency check
     if (idempotencyKey) {
       const exist = await idemGet(idempotencyKey);
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
 
-    // Normalize to GIDs, collect for batch lookup
     const lines = items.map(it => ({
       gid: String(it.variantId).startsWith('gid://')
         ? String(it.variantId)
@@ -174,22 +166,25 @@ app.post('/create-draft-order', async (req, res) => {
     }));
 
     const gids = lines.map(l => l.gid);
-    const priceMap = await getVariantPricesBatch(gids);
+    const priceMap = await getVariantPricesBatch(gids); // this is F-grade price per your setup
 
-    // Build lineItems with authoritative server-side price
-    const lineItems = lines.map(l => ({
-      variantId: l.gid,
-      quantity: l.quantity,
-      originalUnitPrice: computeUnitPrice({ basePrice: priceMap[l.gid], grade: l.grade, cording: l.cording }).toFixed(2),
-      customAttributes: [
-        { key: 'Fabric',  value: l.fabricName },
-        { key: 'Grade',   value: l.grade },
-        { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-        ...l.properties
-      ]
-    }));
+    const lineItems = lines.map(l => {
+      const fPrice = priceMap[l.gid] ?? 0;
+      const unit   = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording }).toFixed(2);
 
-    // Create draft order (with backoff)
+      return {
+        variantId: l.gid,
+        quantity: l.quantity,
+        originalUnitPrice: unit, // final unit price we want to charge
+        customAttributes: [
+          { key: 'Fabric',  value: l.fabricName },
+          { key: 'Grade',   value: l.grade },
+          { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+          ...l.properties
+        ]
+      };
+    });
+
     const mutation = `
       mutation($input: DraftOrderInput!){
         draftOrderCreate(input: $input){
@@ -197,14 +192,17 @@ app.post('/create-draft-order', async (req, res) => {
           userErrors { field message }
         }
       }`;
-    const data = await adminGQL(mutation, { input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] } });
+    const data = await adminGQL(mutation, {
+      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
+    });
+
     const err = data?.draftOrderCreate?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
     const invoiceUrl = data?.draftOrderCreate?.draftOrder?.invoiceUrl;
     if (!invoiceUrl) throw new Error('No invoiceUrl returned');
 
-    if (idempotencyKey) await idemSet(idempotencyKey, { invoiceUrl }, 600); // 10 min
+    if (idempotencyKey) await idemSet(idempotencyKey, { invoiceUrl }, 600);
     res.json({ invoiceUrl });
   } catch (e) {
     console.error('create-draft-order error:', e);
