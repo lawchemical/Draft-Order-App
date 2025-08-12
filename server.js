@@ -200,32 +200,39 @@ app.post('/create-draft-order', async (req, res) => {
     const gids = lines.map(l => l.gid);
     const priceMap = await getVariantPricesBatch(gids); // F-grade Admin price map
 
-    const lineItems = lines.map(l => {
-      const fPrice   = priceMap[l.gid] ?? 0;
-      const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording }); // number
+const lineItems = lines.map(l => {
+  const fPrice   = priceMap[l.gid] ?? 0;
+  const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
 
-      // Prefer cart price when essentially equal to computed (±1% or ≤ $0.50)
-      let unit = computed;
-      if (Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0) {
-        const fromClient = l.unitPriceCents / 100;
-        const absDiff = Math.abs(fromClient - computed);
-        const pctDiff = computed > 0 ? absDiff / computed : 0;
-        const withinTolerance = pctDiff <= 0.01 || absDiff <= 0.50;
-        if (withinTolerance) unit = fromClient;
-      }
+  // Consider it a "fabric" line if we have a fabricName or any Fabric-ish property
+  const looksFabric =
+    !!l.fabricName ||
+    (Array.isArray(l.properties) && l.properties.some(p =>
+      /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
+    ));
 
-      return {
-        variantId: l.gid,
-        quantity: l.quantity,
-        originalUnitPrice: unit.toFixed(2),
-        customAttributes: [
-          { key: 'Fabric',  value: l.fabricName },
-          { key: 'Grade',   value: l.grade },
-          { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-          ...l.properties
-        ]
-      };
-    });
+  let unit;
+  if (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0) {
+    // Always trust cart price for fabric lines
+    unit = l.unitPriceCents / 100;
+  } else {
+    // Non‑fabric (or no cart price): use backend computation
+    unit = computed;
+  }
+
+  return {
+    variantId: l.gid,
+    quantity: l.quantity,
+    originalUnitPrice: unit.toFixed(2),
+    customAttributes: [
+      { key: 'Fabric',  value: l.fabricName },
+      { key: 'Grade',   value: l.grade },
+      { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+      ...l.properties
+    ]
+  };
+});
+
 
     const mutation = `
       mutation($input: DraftOrderInput!){
