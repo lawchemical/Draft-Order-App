@@ -253,52 +253,5 @@ app.post('/create-draft-order', async (req, res) => {
 });
 
 
-
-
-    const gids = lines.map(l => l.gid);
-    const priceMap = await getVariantPricesBatch(gids); // this is F-grade price per your setup
-
-    const lineItems = lines.map(l => {
-      const fPrice = priceMap[l.gid] ?? 0;
-      const unit   = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording }).toFixed(2);
-
-      return {
-        variantId: l.gid,
-        quantity: l.quantity,
-        originalUnitPrice: unit, // final unit price we want to charge
-        customAttributes: [
-          { key: 'Fabric',  value: l.fabricName },
-          { key: 'Grade',   value: l.grade },
-          { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-          ...l.properties
-        ]
-      };
-    });
-
-    const mutation = `
-      mutation($input: DraftOrderInput!){
-        draftOrderCreate(input: $input){
-          draftOrder { id invoiceUrl }
-          userErrors { field message }
-        }
-      }`;
-    const data = await adminGQL(mutation, {
-      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
-    });
-
-    const err = data?.draftOrderCreate?.userErrors?.[0];
-    if (err) throw new Error(err.message);
-
-    const invoiceUrl = data?.draftOrderCreate?.draftOrder?.invoiceUrl;
-    if (!invoiceUrl) throw new Error('No invoiceUrl returned');
-
-    if (idempotencyKey) await idemSet(idempotencyKey, { invoiceUrl }, 600);
-    res.json({ invoiceUrl });
-  } catch (e) {
-    console.error('create-draft-order error:', e);
-    res.status(400).json({ error: e.message });
-  }
-});
-
 app.get('/healthz', (_, res) => res.send('ok'));
 app.listen(PORT, () => console.log(`Draft Order service on :${PORT}`));
