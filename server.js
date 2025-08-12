@@ -144,8 +144,39 @@ async function getVariantPricesBatch(gids = []) {
 }
 
 // ---------- Route ----------
+// ---------- Route ----------
+let __debugOnce = false;
+
 app.post('/create-draft-order', async (req, res) => {
   try {
+    // One‑shot, safe payload echo
+    if (!__debugOnce) {
+      __debugOnce = true;
+      try {
+        const items = Array.isArray(req.body?.items) ? req.body.items : [];
+        const brief = items.map((it, i) => ({
+          i,
+          variantId: it?.variantId,
+          quantity: it?.quantity,
+          unitPriceCents: it?.unitPriceCents,
+          grade: it?.grade,
+          cording: it?.cording,
+          fabricName: it?.fabricName,
+          props: Array.isArray(it?.properties)
+            ? it.properties.filter(p =>
+                [
+                  'Grade','Cording','Selected Fabric Name','Fabric',
+                  '_fabric_price_unit','_fabric_compare_at','_fabric_discount_unit'
+                ].includes(p?.key)
+              )
+            : undefined
+        }));
+        console.log('[DEBUG one-shot]', { origin: req.headers.origin, items: brief });
+      } catch (e) {
+        console.log('[DEBUG one-shot] (skipped)', String(e?.message || e));
+      }
+    }
+
     const { items = [], note, tags = [], idempotencyKey } = req.body || {};
     if (!items.length) throw new Error('No items');
 
@@ -153,18 +184,74 @@ app.post('/create-draft-order', async (req, res) => {
       const exist = await idemGet(idempotencyKey);
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
-const lines = items.map(it => ({
-  gid: String(it.variantId).startsWith('gid://')
-    ? String(it.variantId)
-    : `gid://shopify/ProductVariant/${it.variantId}`,
-  quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
-  grade: (it.grade || 'A').toUpperCase(),
-  cording: !!it.cording,
-  fabricName: it.fabricName || '',
-  properties: Array.isArray(it.properties) ? it.properties : [],
-  // NEW: carry cart price (in cents) if provided
-  unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
-}));
+
+    const lines = items.map(it => ({
+      gid: String(it.variantId).startsWith('gid://')
+        ? String(it.variantId)
+        : `gid://shopify/ProductVariant/${it.variantId}`,
+      quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
+      grade: String(it.grade || 'A').toUpperCase(),
+      cording: !!it.cording,
+      fabricName: it.fabricName || '',
+      properties: Array.isArray(it.properties) ? it.properties : [],
+      unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
+    }));
+
+    const gids = lines.map(l => l.gid);
+    const priceMap = await getVariantPricesBatch(gids); // F-grade Admin price map
+
+    const lineItems = lines.map(l => {
+      const fPrice   = priceMap[l.gid] ?? 0;
+      const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording }); // number
+
+      // Prefer cart price when essentially equal to computed (±1% or ≤ $0.50)
+      let unit = computed;
+      if (Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0) {
+        const fromClient = l.unitPriceCents / 100;
+        const absDiff = Math.abs(fromClient - computed);
+        const pctDiff = computed > 0 ? absDiff / computed : 0;
+        const withinTolerance = pctDiff <= 0.01 || absDiff <= 0.50;
+        if (withinTolerance) unit = fromClient;
+      }
+
+      return {
+        variantId: l.gid,
+        quantity: l.quantity,
+        originalUnitPrice: unit.toFixed(2),
+        customAttributes: [
+          { key: 'Fabric',  value: l.fabricName },
+          { key: 'Grade',   value: l.grade },
+          { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+          ...l.properties
+        ]
+      };
+    });
+
+    const mutation = `
+      mutation($input: DraftOrderInput!){
+        draftOrderCreate(input: $input){
+          draftOrder { id invoiceUrl }
+          userErrors { field message }
+        }
+      }`;
+    const data = await adminGQL(mutation, {
+      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
+    });
+
+    const err = data?.draftOrderCreate?.userErrors?.[0];
+    if (err) throw new Error(err.message);
+
+    const invoiceUrl = data?.draftOrderCreate?.draftOrder?.invoiceUrl;
+    if (!invoiceUrl) throw new Error('No invoiceUrl returned');
+
+    if (idempotencyKey) await idemSet(idempotencyKey, { invoiceUrl }, 600);
+    res.json({ invoiceUrl });
+  } catch (e) {
+    console.error('create-draft-order error:', e);
+    res.status(400).json({ error: e.message });
+  }
+});
+
 
 
 
