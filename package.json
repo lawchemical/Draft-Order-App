@@ -1,0 +1,21 @@
+{
+  "name": "draft-order-service",
+  "version": "1.0.0",
+  "description": "Railway Node service to create Shopify Draft Orders with custom per-line pricing",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "redis": "^4.6.14"
+  }
+}
