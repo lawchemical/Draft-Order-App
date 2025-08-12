@@ -204,7 +204,7 @@ const lineItems = lines.map(l => {
   const fPrice   = priceMap[l.gid] ?? 0;
   const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
 
-  // Consider it a "fabric" line if we have a fabricName or any Fabric-ish property
+  // Treat as fabric if we have a fabric name or a Fabric-like property
   const looksFabric =
     !!l.fabricName ||
     (Array.isArray(l.properties) && l.properties.some(p =>
@@ -220,6 +220,12 @@ const lineItems = lines.map(l => {
     unit = computed;
   }
 
+  // Debug one-liner to verify what we used
+  console.log('[price]', {
+    gid: l.gid, looksFabric, fromClient: l.unitPriceCents,
+    computed, used: unit
+  });
+
   return {
     variantId: l.gid,
     quantity: l.quantity,
@@ -232,6 +238,7 @@ const lineItems = lines.map(l => {
     ]
   };
 });
+
 
 
     const mutation = `
