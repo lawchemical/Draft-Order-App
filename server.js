@@ -11,9 +11,12 @@ import fetch from 'node-fetch';
 
 // ---------- Config ----------
 const SHOP   = process.env.SHOP;                 // your-store.myshopify.com
-const TOKEN  = process.env.ADMIN_API_TOKEN;      // Admin API token
+const TOKEN  = process.env.ADMIN_API_TOKEN;      // Admin API token with write_draft_orders
 const APIURL = `https://${SHOP}/admin/api/2024-07/graphql.json`;
-const ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+const ORIGINS = (process.env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const PORT = process.env.PORT || 8080;
 
 // Optional Redis (set REDIS_URL to enable)
@@ -144,7 +147,6 @@ async function getVariantPricesBatch(gids = []) {
 }
 
 // ---------- Route ----------
-// ---------- Route ----------
 let __debugOnce = false;
 
 app.post('/create-draft-order', async (req, res) => {
@@ -185,6 +187,7 @@ app.post('/create-draft-order', async (req, res) => {
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
 
+    // Normalize incoming items
     const lines = items.map(it => ({
       gid: String(it.variantId).startsWith('gid://')
         ? String(it.variantId)
@@ -197,98 +200,64 @@ app.post('/create-draft-order', async (req, res) => {
       unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
     }));
 
+    // Get variant base prices (F‑grade) from Admin
     const gids = lines.map(l => l.gid);
-    const priceMap = await getVariantPricesBatch(gids); // F-grade Admin price map
+    const priceMap = await getVariantPricesBatch(gids);
 
-const lineItems = lines.map(l => {
-  const fPrice   = priceMap[l.gid] ?? 0; // variant base (dollars)
-  const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
+    // Build DraftOrderLineItemInput[]
+    const lineItems = lines.map(l => {
+      const fPrice   = priceMap[l.gid] ?? 0; // dollars
+      const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
 
-  // Trust the cart’s fabric price when present; else use backend compute
-  const looksFabric =
-    !!l.fabricName ||
-    (Array.isArray(l.properties) && l.properties.some(p =>
-      /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
-    ));
+      // Prefer the cart’s fabric unit price when present
+      const looksFabric =
+        !!l.fabricName ||
+        (Array.isArray(l.properties) && l.properties.some(p =>
+          /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
+        ));
 
-  const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
-    ? (l.unitPriceCents / 100)      // e.g., 108.00
-    : computed;                      // backend fallback
+      const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
+        ? (l.unitPriceCents / 100)   // e.g. 108.00 from cart
+        : computed;                   // backend fallback
 
-  console.log('[price]', { gid: l.gid, variant: fPrice, fromClient: l.unitPriceCents, computed, used: unit });
+      console.log('[price]', { gid: l.gid, variant: fPrice, fromClient: l.unitPriceCents, computed, used: unit });
 
-  // DOWN-PRICE (desired <= variant): keep variantId, apply per-unit FIXED_AMOUNT discount
-  if (unit <= fPrice) {
-    const off = fPrice - unit; // dollars
-    return {
-      variantId: l.gid,
-      quantity: l.quantity,
-      appliedDiscount: off > 0 ? {
-        title: 'DISCOUNT',
-        valueType: 'FIXED_AMOUNT',
-        value: Number(off.toFixed(2)) // Float, not string
-      } : null,
-      customAttributes: [
-        { key: 'Fabric',  value: l.fabricName },
-        { key: 'Grade',   value: l.grade },
-        { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-        ...l.properties
-      ]
-    };
-  }
+      // DOWN‑PRICE (desired <= variant): keep variant, apply FIXED_AMOUNT discount per unit
+      if (unit <= fPrice) {
+        const off = fPrice - unit; // dollars
+        return {
+          variantId: l.gid,
+          quantity: l.quantity,
+          appliedDiscount: off > 0 ? {
+            title: 'DISCOUNT',
+            valueType: 'FIXED_AMOUNT',
+            value: Number(off.toFixed(2)) // Float! not string
+          } : null,
+          customAttributes: [
+            { key: 'Fabric',  value: l.fabricName },
+            { key: 'Grade',   value: l.grade },
+            { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+            ...l.properties
+          ]
+        };
+      }
 
-  // UP-PRICE (desired > variant): use a CUSTOM line (no variantId) at your price
-  return {
-    title: l.fabricName || 'Custom item',
-    custom: true,
-    quantity: l.quantity,
-    originalUnitPrice: Number(unit.toFixed(2)), // Float
-    customAttributes: [
-      { key: 'Fabric',  value: l.fabricName },
-      { key: 'Grade',   value: l.grade },
-      { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-      ...l.properties
-    ]
-  };
-});
+      // UP‑PRICE (desired > variant): use CUSTOM line at your price
+      return {
+        title: l.fabricName || 'Custom item',
+        custom: true,
+        quantity: l.quantity,
+        originalUnitPrice: Number(unit.toFixed(2)), // Float
+        customAttributes: [
+          { key: 'Fabric',  value: l.fabricName },
+          { key: 'Grade',   value: l.grade },
+          { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+          ...l.properties
+        ]
+      };
+    });
 
-
-
-
-  // UPPRICE (desired > variant): use a CUSTOM line at your price
-  return {
-    title: l.fabricName || 'Custom item',
-    custom: true,
-    quantity: l.quantity,
-    originalUnitPrice: Number(unit.toFixed(2)), // Float
-    customAttributes: [
-      { key: 'Fabric',  value: l.fabricName },
-      { key: 'Grade',   value: l.grade },
-      { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-      ...l.properties
-    ]
-  };
-});
-
-
-  // CASE 2: Desired price > variant → use CUSTOM line at your price
-  return {
-    title: l.fabricName ? `${l.fabricName}` : 'Custom item',
-    custom: true,
-    quantity: l.quantity,
-    originalUnitPrice: unit.toFixed(2),
-    customAttributes: [
-      { key: 'Fabric',  value: l.fabricName },
-      { key: 'Grade',   value: l.grade },
-      { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-      ...(l.properties || [])
-    ]
-  };
-});
-
-
-
-
+    // Create the draft
     const mutation = `
       mutation($input: DraftOrderInput!){
         draftOrderCreate(input: $input){
@@ -296,8 +265,13 @@ const lineItems = lines.map(l => {
           userErrors { field message }
         }
       }`;
+
     const data = await adminGQL(mutation, {
-      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
+      input: {
+        lineItems,
+        note: note || 'Fabric tool',
+        tags: ['fabric-tool', ...tags]
+      }
     });
 
     const err = data?.draftOrderCreate?.userErrors?.[0];
@@ -313,7 +287,6 @@ const lineItems = lines.map(l => {
     res.status(400).json({ error: e.message });
   }
 });
-
 
 app.get('/healthz', (_, res) => res.send('ok'));
 app.listen(PORT, () => console.log(`Draft Order service on :${PORT}`));
