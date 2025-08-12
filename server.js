@@ -201,46 +201,55 @@ app.post('/create-draft-order', async (req, res) => {
     const priceMap = await getVariantPricesBatch(gids); // F-grade Admin price map
 
 const lineItems = lines.map(l => {
-  const fPrice   = priceMap[l.gid] ?? 0; // variant price in dollars
+  const fPrice   = priceMap[l.gid] ?? 0; // variant base price (number, dollars)
   const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
 
-  // Treat as fabric if we have a fabric name or a Fabric-like property
+  // Decide if we trust the client cart unit price (fabric lines) or use backend computed
   const looksFabric =
     !!l.fabricName ||
     (Array.isArray(l.properties) && l.properties.some(p =>
       /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
     ));
 
-  // Decide unit price to use (in dollars)
   const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
-    ? (l.unitPriceCents / 100)   // trust cart for fabric lines
-    : computed;                  // otherwise, backend computation
+    ? (l.unitPriceCents / 100)           // use cart’s unit (e.g., 108.00)
+    : computed;                          // fallback to backend compute
 
-  // Debug so we can see the decision
-  console.log('[price]', {
-    gid: l.gid, looksFabric, fromClient: l.unitPriceCents, computed, variant: fPrice, used: unit
-  });
-
-  // CASE 1: Desired price <= variant → keep variant, apply FIXED_AMOUNT discount per unit
+  // DOWNPRICE (desired <= variant): keep variantId, apply FIXED_AMOUNT discount per unit
   if (unit <= fPrice) {
-    const off = (fPrice - unit); // dollars
+    const off = fPrice - unit;           // dollars
     return {
       variantId: l.gid,
       quantity: l.quantity,
       appliedDiscount: off > 0 ? {
         title: 'DISCOUNT',
         valueType: 'FIXED_AMOUNT',
-        value: off.toFixed(2),
-        amountDiscounted: { amount: off.toFixed(2), currencyCode: 'USD' }
+        value: Number(off.toFixed(2))    // <-- Float, not string
       } : null,
       customAttributes: [
         { key: 'Fabric',  value: l.fabricName },
         { key: 'Grade',   value: l.grade },
         { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
-        ...(l.properties || [])
+        ...l.properties
       ]
     };
   }
+
+  // UPPRICE (desired > variant): use a CUSTOM line at your price
+  return {
+    title: l.fabricName || 'Custom item',
+    custom: true,
+    quantity: l.quantity,
+    originalUnitPrice: Number(unit.toFixed(2)), // Float
+    customAttributes: [
+      { key: 'Fabric',  value: l.fabricName },
+      { key: 'Grade',   value: l.grade },
+      { key: 'Cording', value: l.cording ? 'Yes' : 'No' },
+      ...l.properties
+    ]
+  };
+});
+
 
   // CASE 2: Desired price > variant → use CUSTOM line at your price
   return {
