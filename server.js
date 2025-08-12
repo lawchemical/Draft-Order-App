@@ -201,10 +201,10 @@ app.post('/create-draft-order', async (req, res) => {
     const priceMap = await getVariantPricesBatch(gids); // F-grade Admin price map
 
 const lineItems = lines.map(l => {
-  const fPrice   = priceMap[l.gid] ?? 0; // variant base price in dollars
+  const fPrice   = priceMap[l.gid] ?? 0; // variant base (dollars)
   const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
 
-  // Prefer the client’s cart price for “fabric” items
+  // Trust the cart’s fabric price when present; else use backend compute
   const looksFabric =
     !!l.fabricName ||
     (Array.isArray(l.properties) && l.properties.some(p =>
@@ -212,23 +212,21 @@ const lineItems = lines.map(l => {
     ));
 
   const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
-    ? (l.unitPriceCents / 100)   // e.g. 108.00 from cart
-    : computed;                   // backend fallback
+    ? (l.unitPriceCents / 100)      // e.g., 108.00
+    : computed;                      // backend fallback
 
-  console.log('[price]', {
-    gid: l.gid, looksFabric, fromClient: l.unitPriceCents, computed, variant: fPrice, used: unit
-  });
+  console.log('[price]', { gid: l.gid, variant: fPrice, fromClient: l.unitPriceCents, computed, used: unit });
 
-  // CASE 1: desired unit <= variant → keep variantId, apply per‑unit FIXED_AMOUNT discount
+  // DOWN-PRICE (desired <= variant): keep variantId, apply per-unit FIXED_AMOUNT discount
   if (unit <= fPrice) {
-    const off = fPrice - unit;  // dollars
+    const off = fPrice - unit; // dollars
     return {
       variantId: l.gid,
       quantity: l.quantity,
       appliedDiscount: off > 0 ? {
         title: 'DISCOUNT',
         valueType: 'FIXED_AMOUNT',
-        value: Number(off.toFixed(2))   // Float, not string
+        value: Number(off.toFixed(2)) // Float, not string
       } : null,
       customAttributes: [
         { key: 'Fabric',  value: l.fabricName },
@@ -239,7 +237,7 @@ const lineItems = lines.map(l => {
     };
   }
 
-  // CASE 2: desired unit > variant → custom line at your price
+  // UP-PRICE (desired > variant): use a CUSTOM line (no variantId) at your price
   return {
     title: l.fabricName || 'Custom item',
     custom: true,
@@ -253,6 +251,7 @@ const lineItems = lines.map(l => {
     ]
   };
 });
+
 
 
 
