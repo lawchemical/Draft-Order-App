@@ -1,25 +1,16 @@
-/**
- * Draft Order Service — scalable edition
- * Uses “F-grade as base” pricing:
- *   A_price = F_price / 2.06
- *   unit    = A_price * (1 + gradeUpcharge[grade]) * (cording ? 1.10 : 1)
- */
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 
 // ---------- Config ----------
-const SHOP   = process.env.SHOP;                 // your-store.myshopify.com
-const TOKEN  = process.env.ADMIN_API_TOKEN;      // Admin API token with write_draft_orders
+const SHOP   = process.env.SHOP;
+const TOKEN  = process.env.ADMIN_API_TOKEN;
 const APIURL = `https://${SHOP}/admin/api/2024-07/graphql.json`;
-const ORIGINS = (process.env.ALLOWED_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+const ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 const PORT = process.env.PORT || 8080;
 
-// Optional Redis (set REDIS_URL to enable)
+// ---------- Redis (optional) ----------
 let redis = null;
 if (process.env.REDIS_URL) {
   const { createClient } = await import('redis');
@@ -28,28 +19,26 @@ if (process.env.REDIS_URL) {
   await redis.connect();
 }
 
-// ---------- Utilities ----------
+// ---------- Express ----------
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 app.use(cors({
   origin: (origin, cb) => (!origin || ORIGINS.includes(origin)) ? cb(null, true) : cb(new Error('CORS')),
 }));
 
-// small helper for backoff
+// ---------- Helpers ----------
 async function withBackoff(fn, { tries = 3, baseMs = 250 } = {}) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (e) {
       lastErr = e;
-      const msg = String(e?.message || '');
-      if (!/rate|429|5\d\d/i.test(msg) && !e.retryable) break;
-      await new Promise(r => setTimeout(r, baseMs * Math.pow(2, i) + Math.floor(Math.random()*100)));
+      if (!/rate|429|5\d\d/i.test(String(e?.message || '')) && !e.retryable) break;
+      await new Promise(r => setTimeout(r, baseMs * (2 ** i) + Math.random() * 100));
     }
   }
   throw lastErr;
 }
 
-// ---------- Admin GraphQL ----------
 async function adminGQL(query, variables) {
   return withBackoff(async () => {
     const r = await fetch(APIURL, {
@@ -69,18 +58,15 @@ async function adminGQL(query, variables) {
   });
 }
 
-// ---------- Price Cache (in-memory + optional Redis) ----------
-const MEM_TTL_MS = 10 * 60 * 1000; // 10 min
-const memCache = new Map(); // key -> { value, exp }
-function memGet(key) {
+// ---------- Cache ----------
+const MEM_TTL_MS = 10 * 60 * 1000;
+const memCache = new Map();
+const memGet = key => {
   const v = memCache.get(key);
-  if (!v) return null;
-  if (v.exp < Date.now()) { memCache.delete(key); return null; }
+  if (!v || v.exp < Date.now()) return null;
   return v.value;
-}
-function memSet(key, value, ttl = MEM_TTL_MS) {
-  memCache.set(key, { value, exp: Date.now() + ttl });
-}
+};
+const memSet = (key, value, ttl = MEM_TTL_MS) => memCache.set(key, { value, exp: Date.now() + ttl });
 
 async function cacheGet(key) {
   if (redis) {
@@ -90,14 +76,10 @@ async function cacheGet(key) {
   return memGet(key);
 }
 async function cacheSet(key, value, ttlSec = 600) {
-  if (redis) {
-    await redis.set(key, JSON.stringify(value), { EX: ttlSec });
-  } else {
-    memSet(key, value, ttlSec * 1000);
-  }
+  if (redis) await redis.set(key, JSON.stringify(value), { EX: ttlSec });
+  else memSet(key, value, ttlSec * 1000);
 }
 
-// ---------- Idempotency ----------
 async function idemGet(key) {
   return redis ? JSON.parse(await redis.get(`idem:${key}`) || 'null') : memGet(`idem:${key}`);
 }
@@ -106,23 +88,21 @@ async function idemSet(key, payload, ttlSec = 600) {
   else memSet(`idem:${key}`, payload, ttlSec * 1000);
 }
 
-// ---------- Pricing (F as base) ----------
-const F_MULTIPLIER = 2.06; // F is 106% over A -> F = A * 2.06
+// ---------- Pricing ----------
+const F_MULTIPLIER = 2.06;
 const GRADE_UPCHARGE = { A: 0, B: 0, C: 0.08, D: 0.32, E: 0.63, F: 1.06 };
 
-function computeUnitPriceFromF({ fPrice, grade='A', cording=false }) {
-  const g = (grade || 'A').toUpperCase();
-  const aPrice = (parseFloat(fPrice) || 0) / F_MULTIPLIER;          // normalize to A
-  let unit = aPrice * (1 + (GRADE_UPCHARGE[g] ?? 0));               // apply grade
-  if (cording) unit *= 1.10;                                        // optional cording
-  return Math.round(unit * 100) / 100;                              // 2 decimals
+function computeUnitPriceFromF({ fPrice, grade = 'A', cording = false }) {
+  const g = grade.toUpperCase();
+  const aPrice = (parseFloat(fPrice) || 0) / F_MULTIPLIER;
+  let unit = aPrice * (1 + (GRADE_UPCHARGE[g] ?? 0));
+  if (cording) unit *= 1.10;
+  return Math.round(unit * 100) / 100;
 }
 
-// Batch fetch variant prices (unique GIDs)
-async function getVariantPricesBatch(gids = []) {
+async function getVariantPricesBatch(gids) {
   const uniq = [...new Set(gids)];
   const prices = {};
-
   const missing = [];
   for (const gid of uniq) {
     const cached = await cacheGet(`vprice:${gid}`);
@@ -133,7 +113,6 @@ async function getVariantPricesBatch(gids = []) {
 
   const fields = missing.map((gid, i) => `v${i}: productVariant(id: "${gid}") { id price }`).join('\n');
   const query = `query { ${fields} }`;
-
   const data = await adminGQL(query, {});
   missing.forEach((gid, i) => {
     const node = data[`v${i}`];
@@ -142,41 +121,27 @@ async function getVariantPricesBatch(gids = []) {
     prices[gid] = priceNum;
     cacheSet(`vprice:${gid}`, priceNum, 600);
   });
-
   return prices;
 }
 
 // ---------- Route ----------
 let __debugOnce = false;
-
 app.post('/create-draft-order', async (req, res) => {
   try {
-    // One‑shot, safe payload echo
     if (!__debugOnce) {
       __debugOnce = true;
-      try {
-        const items = Array.isArray(req.body?.items) ? req.body.items : [];
-        const brief = items.map((it, i) => ({
+      console.log('[DEBUG one-shot]', {
+        origin: req.headers.origin,
+        items: (req.body?.items || []).map((it, i) => ({
           i,
           variantId: it?.variantId,
           quantity: it?.quantity,
           unitPriceCents: it?.unitPriceCents,
           grade: it?.grade,
           cording: it?.cording,
-          fabricName: it?.fabricName,
-          props: Array.isArray(it?.properties)
-            ? it.properties.filter(p =>
-                [
-                  'Grade','Cording','Selected Fabric Name','Fabric',
-                  '_fabric_price_unit','_fabric_compare_at','_fabric_discount_unit'
-                ].includes(p?.key)
-              )
-            : undefined
-        }));
-        console.log('[DEBUG one-shot]', { origin: req.headers.origin, items: brief });
-      } catch (e) {
-        console.log('[DEBUG one-shot] (skipped)', String(e?.message || e));
-      }
+          fabricName: it?.fabricName
+        }))
+      });
     }
 
     const { items = [], note, tags = [], idempotencyKey } = req.body || {};
@@ -187,7 +152,6 @@ app.post('/create-draft-order', async (req, res) => {
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
 
-    // Normalize incoming items
     const lines = items.map(it => ({
       gid: String(it.variantId).startsWith('gid://')
         ? String(it.variantId)
@@ -200,38 +164,31 @@ app.post('/create-draft-order', async (req, res) => {
       unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
     }));
 
-    // Get variant base prices (F‑grade) from Admin
-    const gids = lines.map(l => l.gid);
-    const priceMap = await getVariantPricesBatch(gids);
+    const priceMap = await getVariantPricesBatch(lines.map(l => l.gid));
 
-    // Build DraftOrderLineItemInput[]
     const lineItems = lines.map(l => {
-      const fPrice   = priceMap[l.gid] ?? 0; // dollars
+      const fPrice   = priceMap[l.gid] ?? 0;
       const computed = computeUnitPriceFromF({ fPrice, grade: l.grade, cording: l.cording });
-
-      // Prefer the cart’s fabric unit price when present
       const looksFabric =
         !!l.fabricName ||
         (Array.isArray(l.properties) && l.properties.some(p =>
           /^(Fabric|Selected Fabric Name)$/i.test(p?.key || '')
         ));
-
       const unit = (looksFabric && Number.isFinite(l.unitPriceCents) && l.unitPriceCents > 0)
-        ? (l.unitPriceCents / 100)   // e.g. 108.00 from cart
-        : computed;                   // backend fallback
+        ? (l.unitPriceCents / 100)
+        : computed;
 
-      console.log('[price]', { gid: l.gid, variant: fPrice, fromClient: l.unitPriceCents, computed, used: unit });
+      console.log('[price]', { gid: l.gid, variant: fPrice, used: unit });
 
-      // DOWN‑PRICE (desired <= variant): keep variant, apply FIXED_AMOUNT discount per unit
       if (unit <= fPrice) {
-        const off = fPrice - unit; // dollars
+        const off = fPrice - unit;
         return {
           variantId: l.gid,
           quantity: l.quantity,
           appliedDiscount: off > 0 ? {
             title: 'DISCOUNT',
             valueType: 'FIXED_AMOUNT',
-            value: Number(off.toFixed(2)) // Float! not string
+            value: Number(off.toFixed(2))
           } : null,
           customAttributes: [
             { key: 'Fabric',  value: l.fabricName },
@@ -242,12 +199,11 @@ app.post('/create-draft-order', async (req, res) => {
         };
       }
 
-      // UP‑PRICE (desired > variant): use CUSTOM line at your price
       return {
         title: l.fabricName || 'Custom item',
         custom: true,
         quantity: l.quantity,
-        originalUnitPrice: Number(unit.toFixed(2)), // Float
+        originalUnitPrice: Number(unit.toFixed(2)),
         customAttributes: [
           { key: 'Fabric',  value: l.fabricName },
           { key: 'Grade',   value: l.grade },
@@ -257,7 +213,6 @@ app.post('/create-draft-order', async (req, res) => {
       };
     });
 
-    // Create the draft
     const mutation = `
       mutation($input: DraftOrderInput!){
         draftOrderCreate(input: $input){
@@ -265,13 +220,8 @@ app.post('/create-draft-order', async (req, res) => {
           userErrors { field message }
         }
       }`;
-
     const data = await adminGQL(mutation, {
-      input: {
-        lineItems,
-        note: note || 'Fabric tool',
-        tags: ['fabric-tool', ...tags]
-      }
+      input: { lineItems, note: note || 'Fabric tool', tags: ['fabric-tool', ...tags] }
     });
 
     const err = data?.draftOrderCreate?.userErrors?.[0];
