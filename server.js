@@ -154,16 +154,19 @@ app.post('/create-draft-order', async (req, res) => {
       if (exist?.invoiceUrl) return res.json({ invoiceUrl: exist.invoiceUrl });
     }
 
-    const lines = items.map(it => ({
-      gid: String(it.variantId).startsWith('gid://')
-        ? String(it.variantId)
-        : `gid://shopify/ProductVariant/${it.variantId}`,
-      quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
-      grade: (it.grade || 'A').toUpperCase(),
-      cording: !!it.cording,
-      fabricName: it.fabricName || '',
-      properties: Array.isArray(it.properties) ? it.properties : []
-    }));
+const lines = items.map(it => ({
+  gid: String(it.variantId).startsWith('gid://')
+    ? String(it.variantId)
+    : `gid://shopify/ProductVariant/${it.variantId}`,
+  quantity: Math.max(1, parseInt(it.quantity, 10) || 1),
+  grade: (it.grade || 'A').toUpperCase(),
+  cording: !!it.cording,
+  fabricName: it.fabricName || '',
+  properties: Array.isArray(it.properties) ? it.properties : [],
+  // NEW: pass through the cart’s computed price (in cents) if present
+  unitPriceCents: Number.isFinite(it.unitPriceCents) ? it.unitPriceCents : null
+}));
+
 
     const gids = lines.map(l => l.gid);
     const priceMap = await getVariantPricesBatch(gids); // this is F-grade price per your setup
